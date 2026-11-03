@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Wikipedia Deep Research</title>
+        <title>Box Office Detective</title>
         <style>
             * {
                 box-sizing: border-box;
@@ -41,8 +41,7 @@
                 justify-content: space-between;
                 align-items: baseline;
             }
-            #question,
-            #url {
+            #question {
                 width: 100%;
                 padding: 0.6rem 0;
                 border: none;
@@ -50,8 +49,7 @@
                 font-size: 1rem;
                 outline: none;
             }
-            #question:focus,
-            #url:focus {
+            #question:focus {
                 border-bottom-color: #000;
             }
             #task label {
@@ -108,16 +106,13 @@
     </head>
     <body>
         <main>
-            <h1>Deep research: a lead splits your question, researchers walk Wikipedia in parallel, and a writer turns their findings into a cited report</h1>
+            <h1>Box Office Detective: a lead splits your Broadway question, specialist researchers query weekly grosses and Tony Awards in parallel, and a writer turns their findings into a cited report</h1>
 
             <section>
                 <h2>Task</h2>
                 <form id="task">
                     <label>Question
-                        <input id="question" value="How did the Apollo program's computers influence later computing?" placeholder="What do you want to know?" autocomplete="off" />
-                    </label>
-                    <label>Starting article
-                        <input id="url" value="https://en.wikipedia.org/wiki/Apollo_program" placeholder="A Wikipedia URL, e.g. https://en.wikipedia.org/wiki/Apollo_program" autocomplete="off" />
+                        <input id="question" value="Did Hamilton's grosses rise after it won Best Musical?" placeholder="Ask about a Broadway show" autocomplete="off" />
                     </label>
                     <button id="run" type="submit">Run</button>
                 </form>
@@ -167,7 +162,7 @@
             $("task").addEventListener("submit", (e) => {
                 e.preventDefault();
                 if (source) source.close();
-                const params = new URLSearchParams({ question: $("question").value.trim(), url: $("url").value.trim() });
+                const params = new URLSearchParams({ question: $("question").value.trim() });
 
                 $("activity").replaceChildren();
                 $("output").className = "empty";

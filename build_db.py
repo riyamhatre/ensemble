@@ -2,9 +2,10 @@
 
     uv run build_db.py
 
-Only grosses exist so far, so this first version creates *provisional* productions straight from
-grosses_runs.csv. When link_shows.py exists it will write a canonical productions.csv (IBDB-backed)
-and the PRODUCTIONS step below will read that instead. The rest of the script stays the same.
+Only grosses and Tonys exist so far, so this version creates *provisional* productions straight from
+grosses_runs.csv, and links Tony nominees to them with a provisional title-and-date match
+(match_awards_provisional). When link_shows.py exists it will write a canonical productions.csv
+(IBDB-backed) and the award links, and both provisional steps below go away. The rest stays the same.
 
 The database is disposable: delete it and rerun. Fix data in the CSVs or the ingest scripts,
 never in the .db file.
@@ -12,9 +13,13 @@ never in the .db file.
 
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ingest"))
+from titles import fold  # noqa: E402  (shared with the ingest scripts; broadway_data imports it from here)
 
 ROOT = Path(__file__).resolve().parent
 CSV = ROOT / "data" / "csv"
@@ -68,11 +73,85 @@ def provisional_productions(runs: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# PROVISIONAL TONY MATCH. One place; link_shows.py replaces it.
+# A nominee links to a production when the folded titles are equal and the run was on Broadway
+# during that ceremony's season: it started on or before the ceremony and its last grosses week
+# is after the previous ceremony, less SEASON_SLACK_WEEKS (a show that opened in May and closed
+# before the June ceremony a year earlier still counts). If several runs fit, the latest-starting
+# one wins, so a 1997 'Chicago' revival nominee gets the 1996 revival, not an older run.
+# Using the previous ceremony instead of "one year before" matters for 2021: that ceremony was in
+# September and covered shows that closed at the March 2020 shutdown.
+SEASON_SLACK_WEEKS = 8
+# ---------------------------------------------------------------------------
+
+
+def match_awards_provisional(awards: pd.DataFrame, prods: pd.DataFrame, cer: pd.DataFrame) -> pd.Series:
+    """production_id for each award row (None if nothing fits), aligned to awards.index."""
+    cer = cer.sort_values("ceremony_date").reset_index(drop=True)
+    dates = pd.to_datetime(cer["ceremony_date"])
+    prev = dates.shift(1).fillna(dates.iloc[0] - pd.Timedelta(days=365))
+    season_start = dict(zip(cer["year"], prev - pd.Timedelta(weeks=SEASON_SLACK_WEEKS)))
+    ceremony = dict(zip(cer["year"], dates))
+
+    by_title: dict[str, list] = {}
+    for p in prods.itertuples():
+        by_title.setdefault(fold(p.title), []).append(
+            (pd.Timestamp(p.first_week), pd.Timestamp(p.last_week), p.production_id)
+        )
+
+    # The grosses data starts 1985-06-09, a week after the 1985 ceremony. A run already open in the
+    # data's first week may have started any time before, so it passes the "started by the ceremony" test.
+    data_start = prods["first_week"].min()
+
+    out = {}
+    for i, a in awards.iterrows():
+        fits = [
+            (first, pid)
+            for first, last, pid in by_title.get(fold(a["show_title"]), [])
+            if (first <= ceremony[a["year"]] or first == pd.Timestamp(data_start))
+            and last >= season_start[a["year"]]
+        ]
+        out[i] = max(fits)[1] if fits else None
+    return pd.Series(out)
+
+
+# ---------------------------------------------------------------------------
+# PROVISIONAL RECORDING MATCH. One place; link_shows.py replaces it.
+# A cast recording links to a production of the same (folded) title when its cast_year (from the
+# MusicBrainz disambiguation, e.g. '1996 Broadway revival cast', else the release year) is within
+# RECORDING_SLACK_YEARS of the run: albums are often recorded in previews, or come out after closing.
+# If several runs fit, the one that started closest to cast_year wins. Recordings of productions
+# that closed before the grosses data starts (the 1975 'Chicago') match nothing and are left out.
+RECORDING_SLACK_YEARS = 1
+# ---------------------------------------------------------------------------
+
+
+def match_recordings_provisional(rec: pd.DataFrame, prods: pd.DataFrame) -> pd.Series:
+    """production_id for each recording row (None if nothing fits), aligned to rec.index."""
+    by_title: dict[str, list] = {}
+    for p in prods.itertuples():
+        by_title.setdefault(fold(p.title), []).append((int(p.first_week[:4]), int(p.last_week[:4]), p.production_id))
+    out = {}
+    for i, r in rec.iterrows():
+        year = r["cast_year"]
+        fits = [] if pd.isna(year) else [
+            (abs(first - year), -first, pid)
+            for first, last, pid in by_title.get(fold(r["show_title"]), [])
+            if first - RECORDING_SLACK_YEARS <= year <= last + RECORDING_SLACK_YEARS
+        ]
+        out[i] = min(fits)[2] if fits else None
+    return pd.Series(out, dtype=object)
+
+
 def main() -> None:
     weekly = pd.read_csv(CSV / "grosses_weekly.csv")
     runs = pd.read_csv(CSV / "grosses_runs.csv")
+    cer = pd.read_csv(CSV / "tony_ceremonies.csv")
+    awards = pd.read_csv(CSV / "tony_awards.csv")
 
     prods = provisional_productions(runs)
+    prods = prods.merge(runs[["run_id", "first_week", "last_week"]], on="run_id")  # for the Tony match only
     run_to_prod = dict(zip(prods["run_id"], prods["production_id"]))
 
     DB.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +187,50 @@ def main() -> None:
         "Broadway only: tours are not included. Preview weeks are in the data.')",
         (g["week_ending"].min(), g["week_ending"].max()),
     )
+
+    # Tonys. Ceremonies first: awards.year references them.
+    cer[["year", "ceremony_number", "ceremony_date", "source_url"]].to_sql(
+        "tony_ceremonies", con, if_exists="append", index=False
+    )
+    awards["production_id"] = match_awards_provisional(awards, prods, cer)
+    acols = ["year", "category", "nominee", "production_id", "won", "source_url"]
+    awards[acols].to_sql("awards", con, if_exists="append", index=False)
+
+    tony_alias = awards.dropna(subset=["production_id"]).drop_duplicates(["show_title", "production_id"])
+    tony_alias = pd.DataFrame(
+        {"alias": tony_alias["show_title"], "source": "tonys", "production_id": tony_alias["production_id"],
+         "match_method": "exact"}  # exact after case/accent/punctuation folding, see fold()
+    )
+    # aliases is COLLATE NOCASE, so two spellings differing only in case collide on the primary key
+    tony_alias = tony_alias[~tony_alias.assign(a=tony_alias["alias"].str.lower()).duplicated(["a", "production_id"])]
+    tony_alias.to_sql("aliases", con, if_exists="append", index=False)
+
+    con.execute(
+        "INSERT INTO data_sources (source, description, covers_from, covers_to, fetched_at, notes) "
+        "VALUES ('tonys', 'Tony Award winners and nominees, competitive categories (Wikipedia ceremony pages)', ?, ?, "
+        "date('now'), 'Ceremonies 1985-2026 (no 2020 ceremony; the 2021 one was in September). Special Tonys not included. "
+        "Nominees are linked to productions by a provisional title-and-season match, so some have no production.')",
+        (cer["ceremony_date"].min(), cer["ceremony_date"].max()),
+    )
+
+    # Cast recordings and tracks (MusicBrainz)
+    rec = pd.read_csv(CSV / "recordings.csv")
+    tracks = pd.read_csv(CSV / "tracks.csv")
+    rec["production_id"] = match_recordings_provisional(rec, prods)
+    linked = rec.dropna(subset=["production_id"])
+    pd.DataFrame(
+        {"recording_id": linked["mbid"], "production_id": linked["production_id"], "title": linked["title"],
+         "year": linked["cast_year"].astype("Int64"), "mbid": linked["mbid"], "source_url": linked["source_url"]}
+    ).to_sql("recordings", con, if_exists="append", index=False)
+    tr = tracks[tracks["mbid"].isin(linked["mbid"])].rename(columns={"mbid": "recording_id"})
+    tr[["recording_id", "disc", "position", "title"]].to_sql("tracks", con, if_exists="append", index=False)
+    con.execute(
+        "INSERT INTO data_sources (source, description, covers_from, covers_to, fetched_at, notes) "
+        "VALUES ('musicbrainz', 'Broadway cast recordings and track lists (MusicBrainz, CC0)', NULL, NULL, date('now'), "
+        "'Only recordings MusicBrainz labels as a Broadway cast, of productions in the grosses data. "
+        "Track lists are of one official release per recording, so bonus tracks on other editions may be missing. "
+        "Off-Broadway, London and tour recordings are not included.')"
+    )
     con.commit()
 
     # Checks. Fail loudly rather than ship a database that quietly disagrees with its CSVs.
@@ -122,6 +245,20 @@ def main() -> None:
     ).fetchone()
     print(f"{n_p:,} productions, {n_g:,} gross rows -> {DB}")
     print(f"closed_early: {flagged:,} of {closed:,} closed productions flagged (rule: under {CLOSED_EARLY_WEEKS} weeks)")
+
+    n_a = con.execute("SELECT COUNT(*) FROM awards").fetchone()[0]
+    assert n_a == len(awards), f"awards rows {n_a} != CSV rows {len(awards)}"
+    # Grosses end in March 2020, so only ceremonies through 2021 can match. Later ones wait for new grosses.
+    for label, where in (("1985-2021", "year <= 2021"), ("2022-2026", "year > 2021")):
+        linked, total = con.execute(
+            f"SELECT COUNT(production_id), COUNT(*) FROM awards WHERE {where}"
+        ).fetchone()
+        print(f"awards {label}: {linked:,} of {total:,} nominee rows linked to a production ({linked / total:.1%})")
+
+    n_r, n_t = con.execute("SELECT (SELECT COUNT(*) FROM recordings), (SELECT COUNT(*) FROM tracks)").fetchone()
+    assert n_t == len(tr), f"tracks rows {n_t} != linked CSV rows {len(tr)}"
+    print(f"recordings: {n_r:,} of {len(rec):,} linked to a production, {n_t:,} tracks "
+          f"(unlinked are mostly casts from before the grosses data)")
     con.close()
 
 

@@ -13,3 +13,9 @@ __pycache__/
 
 # raw data
 data/raw/
+
+# Built database: rebuild with `uv run build_db.py`
+data/broadway.db
+
+# Personal
+CLAUDE.md

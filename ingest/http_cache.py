@@ -4,7 +4,6 @@
 
     html = fetch("https://www.ibdb.com/broadway-production/wicked-12345")
     data = fetch_json("https://musicbrainz.org/ws/2/release-group", params={"query": "wicked", "fmt": "json"})
-    nyt = fetch_json(NYT_URL, params={"q": "Wicked"}, secret_params={"api-key": KEY})
 
 What it does:
   - Caches every successful response on disk under data/raw/<host>/, so re-parsing is free
@@ -45,7 +44,7 @@ HOST_INTERVALS = {
     "musicbrainz.org": 1.1,  # MusicBrainz asks for at most ~1 request/second
     "www.ibdb.com": 2.0,
     "en.wikipedia.org": 1.0,
-    "api.nytimes.com": 12.5,  # ~5 requests/minute; there is also a daily cap
+    # NYT is not here on purpose: its terms forbid keeping content over 24 hours, so nyt.py never uses this cache
 }
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
