@@ -10,3 +10,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# raw data
+data/raw/
