@@ -1,6 +1,7 @@
 """Query functions over data/broadway.db: the only way agents see the data.
 
     from broadway_data import find_production, get_grosses, grosses_around_date, get_awards, data_coverage
+    from broadway_data import trouble_signals, tony_effect, get_recordings, compare_recordings, get_cast_changes
 
 Every function returns a JSON string, and catches its own exceptions into {"error": ...}, because the
 model can't see a Python exception (app.py wraps these as tools). Every fact carries a source_url so the
@@ -14,7 +15,9 @@ Smoke test: uv run broadway_data.py
 import difflib
 import functools
 import json
+import re
 import sqlite3
+import statistics
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -32,11 +35,18 @@ MAX_AWARDS = 300
 # so every trend here leaves it out.
 NOT_DARK = "(g.performances + g.previews) > 0"
 
-# Said with every production: the provisional values from build_db.py, until IBDB data replaces them
+# Said with every production: these values are guesses from the grosses data (build_db.py), since no
+# source with full production records allows automated access (IBDB doesn't)
 PROVISIONAL_NOTE = (
     "type (original/revival) is a guess from the grosses data, which starts in 1985: a revival of a show "
     "first staged before 1985 shows as 'original'. opening_date is unknown; first_week may be a preview week."
 )
+
+# trouble_signals: a show's change counts as a warning sign when it trails the market by this many points
+TROUBLE_GROSS_VS_MARKET = -10.0  # average weekly gross
+TROUBLE_TICKET_VS_MARKET = -5.0  # average ticket price: a show cutting prices faster than the market
+# Closed productions in this many years before the week make the "how shows look before closing" benchmark
+TROUBLE_BENCHMARK_YEARS = 5
 
 
 def _connect() -> sqlite3.Connection:
@@ -298,6 +308,11 @@ def grosses_around_date(production_id: str, date_: str, weeks_before: int = 8, w
     (summer and the holidays are strong, January and February weak), so a show's change means little
     until it is compared with the market's.
     """
+    return _around(production_id, date_, weeks_before, weeks_after)
+
+
+def _around(production_id: str, date_: str, weeks_before: int = 8, weeks_after: int = 8) -> dict:
+    """grosses_around_date as a plain dict, so tony_effect can run it for many productions."""
     event = date.fromisoformat(date_)
     p = _production(production_id)
     rows = grosses_rows(production_id)
@@ -406,6 +421,399 @@ def get_awards(
 
 
 # ---------------------------------------------------------------------------
+# Market-wide: questions about many shows at once, which no agent can answer one show at a time
+# ---------------------------------------------------------------------------
+
+
+def _weeks_up_to(week_ending: str | None, n: int) -> list[str]:
+    """The last n week_endings with any grosses, on or before week_ending (default: the data's last week)."""
+    rows = _rows(
+        "SELECT DISTINCT week_ending FROM grosses WHERE week_ending <= COALESCE(?, '9999') "
+        "ORDER BY week_ending DESC LIMIT ?",
+        (week_ending, n),
+    )
+    return sorted(r["week_ending"] for r in rows)
+
+
+def _median(values: list) -> float | None:
+    values = [v for v in values if v is not None]
+    return _r(statistics.median(values), 3) if values else None
+
+
+def _mean(values: list) -> float | None:
+    values = [v for v in values if v is not None]
+    return _r(statistics.mean(values), 1) if values else None
+
+
+def _market_levels(weeks: list[str], exclude: str = "") -> dict:
+    """The whole market's capacity and gross-to-potential over these weeks (every other show playing them),
+    from totals. What a show's own levels are measured against, so January doesn't look like trouble."""
+    if not weeks:
+        return {"capacity_pct": None, "gross_to_potential": None}
+    marks = ",".join("?" * len(weeks))
+    r = _rows(
+        f"""SELECT SUM(g.attendance) AS att, SUM(g.seats_available) AS seats,
+                   SUM(CASE WHEN g.potential_gross > 0 THEN g.gross END) AS gross_p,
+                   SUM(CASE WHEN g.potential_gross > 0 THEN g.potential_gross END) AS pot
+            FROM grosses g WHERE g.week_ending IN ({marks}) AND g.production_id != ? AND {NOT_DARK}""",
+        (*weeks, exclude),
+    )[0]
+    return {
+        "capacity_pct": _r(100 * r["att"] / r["seats"], 1) if r["seats"] else None,
+        "gross_to_potential": _r(r["gross_p"] / r["pot"], 3) if r["pot"] else None,
+    }
+
+
+def _minus(a, b, nd=1):
+    return None if a is None or b is None else round(a - b, nd)
+
+
+@_json_tool
+def trouble_signals(week_ending: str | None = None, weeks: int = 8) -> dict:
+    """Which shows running in a given week showed warning signs at the box office: level_signals (selling
+    below the market now) and trend_signals (falling faster than the market on a year earlier).
+
+    Broadway is seasonal (January and February are weak, summer and the holidays strong), so every
+    measure here is against the rest of the market, never raw. For each show playing that week, over its
+    last `weeks` weeks:
+      - level signals: its capacity, and its gross-to-potential (~1996 on), minus the market's over the
+        same weeks. A show is flagged when it trails the market by more than the median production did in
+        its final `weeks` weeks before closing (the benchmark: productions that closed in the
+        TROUBLE_BENCHMARK_YEARS years before the week).
+      - trend signals, for shows with a year of grosses: average weekly gross and average ticket against
+        the same weeks a year earlier, minus the market's year-over-year change (same-store). Flagged at
+        TROUBLE_GROSS_VS_MARKET and TROUBLE_TICKET_VS_MARKET points (a falling ticket suggests discounting).
+    """
+    recent = _weeks_up_to(week_ending, weeks)
+    if len(recent) < weeks:
+        raise ValueError(f"not enough weeks of data on or before {week_ending}")
+    week = recent[-1]
+    # The same Sundays a year earlier (52 weeks back), for year-over-year trends
+    year_ago = [(date.fromisoformat(w) - timedelta(weeks=52)).isoformat() for w in recent]
+
+    # Benchmark: how far closing productions trailed the market in their final weeks
+    start = date.fromisoformat(week) - timedelta(days=365 * TROUBLE_BENCHMARK_YEARS)
+    closed = _rows(
+        "SELECT production_id FROM productions WHERE closing_date IS NOT NULL AND closing_date > ? AND closing_date <= ?",
+        (start.isoformat(), week),
+    )
+    rel_cap, rel_g2p = [], []
+    for c in closed:
+        rows = [r for r in grosses_rows(c["production_id"]) if not r["preview_week"]][-weeks:]
+        if len(rows) < weeks:
+            continue
+        s = _window_stats(rows)
+        m = _market_levels([r["week_ending"] for r in rows], c["production_id"])
+        rel_cap.append(_minus(s["capacity_pct"], m["capacity_pct"]))
+        rel_g2p.append(_minus(s["gross_to_potential"], m["gross_to_potential"], 3))
+    bench = {
+        "closed_productions": len(rel_cap),
+        "closed_from": start.isoformat(),
+        "closed_to": week,
+        "median_capacity_vs_market": _median(rel_cap),  # percentage points
+        "median_gross_to_potential_vs_market": _median(rel_g2p),
+    }
+
+    mkt_now = _market_levels(recent)
+    yb, ya, n_market = _market(year_ago, recent, "")
+    market_yoy = {m: _pct_change(yb[m], ya[m]) for m in ("avg_weekly_gross", "avg_ticket")}
+
+    running = _rows(
+        f"SELECT g.production_id, p.title FROM grosses g JOIN productions p USING (production_id) "
+        f"WHERE g.week_ending = ? AND {NOT_DARK}",
+        (week,),
+    )
+    shows = []
+    for s in running:
+        pid = s["production_id"]
+        rows = grosses_rows(pid, end=week)
+        now = _window_stats([r for r in rows if r["week_ending"] in recent])
+        then = [r for r in rows if r["week_ending"] in year_ago and not r["preview_week"]]
+        mkt = _market_levels(recent, pid)
+        cap_vs = _minus(now["capacity_pct"], mkt["capacity_pct"])
+        g2p_vs = _minus(now["gross_to_potential"], mkt["gross_to_potential"], 3)
+
+        has_year = len(then) >= weeks / 2
+        sb = _window_stats(then)
+        gross_yoy = _pct_change(sb["avg_weekly_gross"], now["avg_weekly_gross"]) if has_year else None
+        ticket_yoy = _pct_change(sb["avg_ticket"], now["avg_ticket"]) if has_year else None
+        gross_vs = _minus(gross_yoy, market_yoy["avg_weekly_gross"])
+        ticket_vs = _minus(ticket_yoy, market_yoy["avg_ticket"])
+
+        level, trend = [], []  # selling below the market now / falling faster than the market
+        if cap_vs is not None and bench["median_capacity_vs_market"] is not None \
+                and cap_vs < bench["median_capacity_vs_market"]:
+            level.append(f"capacity {now['capacity_pct']}% is {cap_vs:+.1f} points vs the market's "
+                           f"{mkt['capacity_pct']}%, worse than closing shows' median {bench['median_capacity_vs_market']:+.1f}")
+        if g2p_vs is not None and bench["median_gross_to_potential_vs_market"] is not None \
+                and g2p_vs < bench["median_gross_to_potential_vs_market"]:
+            level.append(f"gross-to-potential {now['gross_to_potential']} vs the market's {mkt['gross_to_potential']}, "
+                           f"worse than closing shows' median gap {bench['median_gross_to_potential_vs_market']:+.3f}")
+        if gross_vs is not None and gross_vs <= TROUBLE_GROSS_VS_MARKET:
+            trend.append(f"average weekly gross {gross_yoy:+.1f}% on a year earlier vs the market's "
+                           f"{market_yoy['avg_weekly_gross']:+.1f}%")
+        if ticket_vs is not None and ticket_vs <= TROUBLE_TICKET_VS_MARKET:
+            trend.append(f"average ticket {ticket_yoy:+.1f}% on a year earlier vs the market's "
+                           f"{market_yoy['avg_ticket']:+.1f}% (possible discounting)")
+
+        shows.append({
+            "production_id": pid,
+            "title": s["title"],
+            "weeks_reported": len(rows),
+            "preview_weeks_in_window": now["preview_weeks"],
+            "capacity_pct": now["capacity_pct"],
+            "capacity_vs_market": cap_vs,
+            "gross_to_potential": now["gross_to_potential"],
+            "gross_to_potential_vs_market": g2p_vs,
+            "avg_weekly_gross": now["avg_weekly_gross"],
+            "gross_pct_change_year_on_year": gross_yoy,
+            "gross_yoy_vs_market": gross_vs,
+            "ticket_yoy_vs_market": ticket_vs,
+            "level_signals": level,
+            "trend_signals": trend,
+        })
+    # Level signals first: a show selling below the market now is the stronger warning
+    shows.sort(key=lambda s: (-len(s["level_signals"]), -len(s["trend_signals"]),
+                              s["capacity_vs_market"] if s["capacity_vs_market"] is not None else 0))
+
+    return {
+        "week_ending": week,
+        "weeks": {"from": recent[0], "to": recent[-1]},
+        "year_earlier_weeks": {"from": year_ago[0], "to": year_ago[-1]},
+        "market": {**mkt_now, "year_on_year_pct_change": market_yoy, "same_store_shows": n_market},
+        "benchmark": bench,
+        "shows": shows,
+        "notes": [
+            "Signals are warning signs, not predictions: a limited engagement closes on schedule whatever it grosses, "
+            "and a strong show can still close when its theater is booked.",
+            "Shows with under a year of grosses have no year-on-year trend; a show in previews sells below a running one.",
+            "level_signals: selling below the market now, by more than closing shows typically did. "
+            "trend_signals: falling faster than the market on a year earlier. A trend signal on a show still "
+            "selling above the market's capacity usually means prices coming down from a peak, not trouble.",
+            "Sorted by level signals, then trend signals, then capacity against the market (worst first).",
+            f"Grosses data ends {_source('grosses').get('covers_to')}: 'right now' questions can only be answered "
+            "for the last week of data.",
+        ],
+        "source_url": _rows("SELECT source_url FROM grosses WHERE week_ending = ? LIMIT 1", (week,))[0]["source_url"],
+    }
+
+
+@_json_tool
+def tony_effect(category: str, from_year: int | None = None, to_year: int | None = None, weeks: int = 8) -> dict:
+    """How box office changed after the Tonys for productions that won a category vs those only nominated.
+
+    For every nominee in the matching categories that is linked to a production, runs the same
+    before-and-after-the-ceremony comparison as grosses_around_date, and summarizes the change against
+    the market (percentage points) for winners and for nominees that lost. A production nominated in a
+    category several times (performers) counts once per ceremony, as a winner if any of its nominees won.
+
+    Left out, with the reason: ceremonies whose after-window runs past the end of the grosses data, and
+    productions with under half the weeks in either window (closed soon after, or opened just before), or
+    whose before-window is mostly previews.
+    """
+    where, params = ["a.category LIKE ?", "a.production_id IS NOT NULL"], [f"%{category}%"]
+    if from_year is not None:
+        where.append("a.year >= ?"); params.append(from_year)
+    if to_year is not None:
+        where.append("a.year <= ?"); params.append(to_year)
+    noms = _rows(
+        f"""SELECT a.year, c.ceremony_date, a.production_id, p.title, MAX(a.won) AS won,
+                   GROUP_CONCAT(DISTINCT a.category) AS categories, MIN(a.source_url) AS source_url
+            FROM awards a JOIN tony_ceremonies c USING (year) JOIN productions p USING (production_id)
+            WHERE {' AND '.join(where)}
+            GROUP BY a.year, a.production_id ORDER BY a.year, won DESC""",
+        tuple(params),
+    )
+    if not noms:
+        raise ValueError(
+            f"no nominees for category '{category}' in those years are linked to a production with grosses. "
+            "Nominees after 2021 aren't linked (grosses end in March 2020). Check the category name with get_awards."
+        )
+
+    data_start = date.fromisoformat(_source("grosses").get("covers_from"))
+    data_end = date.fromisoformat(_source("grosses").get("covers_to"))
+    included, excluded = [], []
+    for n in noms:
+        ceremony = date.fromisoformat(n["ceremony_date"])
+        base = {"year": n["year"], "production_id": n["production_id"], "title": n["title"], "won": bool(n["won"])}
+        if ceremony + timedelta(weeks=weeks) > data_end:
+            excluded.append({**base, "reason": f"the weeks after the ceremony are past the end of the data ({data_end})"})
+            continue
+        if ceremony < data_start:
+            excluded.append({**base, "reason": f"the grosses data starts after this ceremony ({data_start})"})
+            continue
+        r = _around(n["production_id"], n["ceremony_date"], weeks, weeks)
+        enough = r["before"]["weeks"] >= weeks / 2 and r["after"]["weeks"] >= weeks / 2
+        mostly_previews = r["before"]["preview_weeks"] > r["before"]["weeks"] / 2
+        vs = r["pct_change_vs_market"]["avg_weekly_gross"]
+        if not enough or vs is None:
+            excluded.append({**base, "reason": f"only {r['before']['weeks']} weeks before and {r['after']['weeks']} after"})
+        elif mostly_previews:
+            excluded.append({**base, "reason": "most of the weeks before the ceremony were previews"})
+        else:
+            included.append({**base, "gross_pct_change": r["pct_change"]["avg_weekly_gross"],
+                             "gross_pct_change_vs_market": vs,
+                             "capacity_pct_change_vs_market": r["pct_change_vs_market"]["capacity_pct"],
+                             "source_url": n["source_url"]})
+
+    def summary(group: list[dict]) -> dict:
+        vs = [g["gross_pct_change_vs_market"] for g in group]
+        return {
+            "productions": len(group),
+            "median_gross_pct_change_vs_market": _median(vs),
+            "mean_gross_pct_change_vs_market": _mean(vs),
+            "share_that_beat_the_market": _r(sum(v > 0 for v in vs) / len(vs), 2) if vs else None,
+            "median_capacity_pct_change_vs_market": _median([g["capacity_pct_change_vs_market"] for g in group]),
+        }
+
+    winners = summary([g for g in included if g["won"]])
+    losers = summary([g for g in included if not g["won"]])
+    gap = (None if winners["median_gross_pct_change_vs_market"] is None or losers["median_gross_pct_change_vs_market"]
+           is None else round(winners["median_gross_pct_change_vs_market"] - losers["median_gross_pct_change_vs_market"], 1))
+    warnings = []
+    if min(winners["productions"], losers["productions"]) < 10:
+        warnings.append(f"small groups ({winners['productions']} winners, {losers['productions']} nominees that lost): "
+                        "one show can move a median a lot")
+
+    return {
+        "category": category,
+        "categories_matched": sorted({c for n in noms for c in n["categories"].split(",")}),
+        "years": {"from": noms[0]["year"], "to": noms[-1]["year"]},
+        "weeks_each_side": weeks,
+        "winners": winners,
+        "nominated_only": losers,
+        "median_gap_winners_minus_nominated": gap,
+        "productions": included,
+        "excluded": excluded,
+        "warnings": warnings,
+        "notes": [
+            "Changes are against the market (same-store, as in grosses_around_date), in percentage points.",
+            "This is an association, not proof the award caused it: winners were often already the stronger "
+            "sellers, and nominations alone can lift a show before the ceremony.",
+            f"Grosses end {data_end}, so ceremonies after 2019 can't be measured.",
+        ],
+        "source_url": _rows("SELECT source_url FROM grosses LIMIT 1")[0]["source_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Music: Broadway cast recordings (MusicBrainz)
+# ---------------------------------------------------------------------------
+
+
+def _song_key(title: str) -> str:
+    """'Defying Gravity (Reprise)' and 'Defying Gravity' -> 'defying gravity': how compare_recordings matches songs."""
+    t = re.sub(r"\(.*?\)|\[.*?\]", " ", title)
+    t = re.sub(r"\breprise\b", " ", fold(t))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _recordings(production_id: str) -> list[dict]:
+    recs = _rows(
+        "SELECT recording_id, title, year, source_url FROM recordings WHERE production_id = ? ORDER BY year, title",
+        (production_id,),
+    )
+    for r in recs:
+        r["tracks"] = _rows(
+            "SELECT disc, position, title FROM tracks WHERE recording_id = ? ORDER BY disc, position",
+            (r["recording_id"],),
+        )
+    return recs
+
+
+@_json_tool
+def get_recordings(production_id: str) -> dict:
+    """A production's Broadway cast recordings, each with its track list."""
+    p = _production(production_id)
+    recs = _recordings(production_id)
+    return {
+        "production": {k: p[k] for k in ("production_id", "title", "first_week", "last_week")},
+        "recordings": recs,
+        "notes": [
+            "Only recordings MusicBrainz labels as a Broadway cast are here: no London, tour, film or "
+            "off-Broadway albums.",
+            "A cast album is not a complete song list: shows sometimes leave songs off the album.",
+        ] + ([] if recs else ["This production has no linked Broadway cast recording."]),
+    }
+
+
+@_json_tool
+def compare_recordings(production_a: str, production_b: str) -> dict:
+    """Which songs are on both productions' cast recordings, and which only on one: e.g. an original vs
+    its revival. Matches titles ignoring case, punctuation, accents, '(Reprise)' and other parentheticals.
+    When a production has more than one recording, the earliest is used and the others are listed.
+    """
+    sides = {}
+    for label, pid in (("a", production_a), ("b", production_b)):
+        p = _production(pid)
+        recs = _recordings(pid)
+        if not recs:
+            raise LookupError(f"{pid} has no linked Broadway cast recording, so there is nothing to compare. "
+                              "Call get_recordings to check.")
+        sides[label] = {"production": {k: p[k] for k in ("production_id", "title", "first_week", "last_week")},
+                        "recording": {k: recs[0][k] for k in ("recording_id", "title", "year", "source_url")},
+                        "other_recordings": [r["title"] for r in recs[1:]], "tracks": recs[0]["tracks"]}
+
+    def by_key(tracks: list[dict]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for t in tracks:
+            # A medley track ('A Very Nice Prince / First Midnight') holds several songs
+            for part in t["title"].split(" / "):
+                out.setdefault(_song_key(part), part.strip())  # first spelling, in album order
+        out.pop("", None)
+        return out
+
+    a, b = by_key(sides["a"]["tracks"]), by_key(sides["b"]["tracks"])
+    warnings = []
+    if fold(sides["a"]["production"]["title"]) != fold(sides["b"]["production"]["title"]):
+        warnings.append("these are productions of two different shows, not an original and a revival")
+    return {
+        "warnings": warnings,
+        "a": {k: v for k, v in sides["a"].items() if k != "tracks"} | {"songs": len(a)},
+        "b": {k: v for k, v in sides["b"].items() if k != "tracks"} | {"songs": len(b)},
+        "in_both": [a[k] for k in a if k in b],
+        "only_in_a": [a[k] for k in a if k not in b],
+        "only_in_b": [b[k] for k in b if k not in a],
+        "notes": [
+            "Compares the cast albums, not the stage shows: a song missing from an album may still have been performed.",
+            "A renamed song shows up as one cut plus one added; check only_in_a against only_in_b for near matches.",
+            "Reprises count as the same song, and a medley track counts as each song in it.",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cast changes (hand-curated: no full source allows automated access)
+# ---------------------------------------------------------------------------
+
+
+@_json_tool
+def get_cast_changes(production_id: str | None = None, person_contains: str | None = None) -> dict:
+    """Dated cast changes (a performer joining or leaving), from a small hand-curated list. Give at least one filter."""
+    if production_id is None and person_contains is None:
+        raise ValueError("give production_id or person_contains")
+    where, params = ["1=1"], []
+    if production_id is not None:
+        where.append("c.production_id = ?"); params.append(production_id)
+    if person_contains is not None:
+        where.append("c.person LIKE ?"); params.append(f"%{person_contains}%")
+    rows = _rows(
+        f"""SELECT c.production_id, p.title, c.person, c.role, c.start_date, c.end_date, c.is_star, c.source_url
+            FROM cast_changes c JOIN productions p USING (production_id)
+            WHERE {' AND '.join(where)} ORDER BY c.start_date""",
+        tuple(params),
+    )
+    total = _rows("SELECT COUNT(*) AS n FROM cast_changes")[0]["n"]
+    return {
+        "cast_changes": rows,
+        "notes": [
+            f"Cast changes are hand-curated: {total} in the whole database, for a small set of shows. "
+            "No match means it isn't recorded here, not that it didn't happen.",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Coverage
 # ---------------------------------------------------------------------------
 
@@ -415,15 +823,20 @@ def data_coverage() -> dict:
     """What each source covers, so an answer can say where the data stops."""
     counts = _rows(
         """SELECT (SELECT COUNT(*) FROM productions) AS productions, (SELECT COUNT(*) FROM grosses) AS gross_weeks,
-                  (SELECT COUNT(*) FROM awards) AS award_rows"""
+                  (SELECT COUNT(*) FROM awards) AS award_rows, (SELECT COUNT(*) FROM recordings) AS recordings,
+                  (SELECT COUNT(*) FROM cast_changes) AS cast_changes"""
     )[0]
+    not_available = [
+        "profitability and recoupment", "audience demographics", "per-performance data (grosses are weekly)",
+        "touring and off-Broadway productions, and their recordings",
+        "song lists beyond Broadway cast albums",
+    ]
+    if not counts["cast_changes"]:
+        not_available.append("cast changes and replacement dates")
     return {
         "sources": _rows("SELECT source, description, covers_from, covers_to, fetched_at, notes FROM data_sources"),
         "counts": counts,
-        "not_available": [
-            "profitability and recoupment", "audience demographics", "per-performance data (grosses are weekly)",
-            "touring and off-Broadway productions",
-        ],
+        "not_available": not_available,
     }
 
 
@@ -463,4 +876,40 @@ if __name__ == "__main__":
     assert "error" in d
     d = show("no filter -> error", get_awards())
     assert "error" in d
+    # Market-wide
+    d = show("trouble_signals, week of 2019-08-04", trouble_signals("2019-08-04"), ["week_ending", "market", "benchmark"])
+    flagged = [s["production_id"] for s in d["shows"] if s["level_signals"]]
+    print("level signals:", flagged)
+    # All three closed in August 2019, weeks after this date
+    assert {"pretty-woman-the-musical-2018", "the-cher-show-2018", "king-kong-2018"} <= set(flagged), flagged
+    for hit in ("wicked-2003", "the-lion-king-1997", "hamilton-2015", "dear-evan-hansen-2016"):
+        assert hit not in flagged, f"{hit} sells above the market and shouldn't have a level signal"
+    d = show("trouble_signals, too early -> error", trouble_signals("1985-07-01"))
+    assert "error" in d
+
+    d = show("tony_effect Best Musical", tony_effect("Best Musical"),
+             ["winners", "nominated_only", "median_gap_winners_minus_nominated", "warnings"])
+    assert d["winners"]["productions"] > 20 and d["nominated_only"]["productions"] > 40
+    hamilton = [p for p in d["productions"] if p["production_id"] == "hamilton-2015"][0]
+    same = json.loads(grosses_around_date("hamilton-2015", "2016-06-12"))["pct_change_vs_market"]["avg_weekly_gross"]
+    assert hamilton["gross_pct_change_vs_market"] == same, "tony_effect must agree with grosses_around_date"
+    d = show("tony_effect 2022+ -> error (not linked)", tony_effect("Best Musical", 2022, 2026))
+    assert "error" in d
+
+    # Music
+    d = show("compare_recordings Into the Woods 1987 vs 2002", compare_recordings("into-the-woods-1987", "into-the-woods-2002"),
+             ["only_in_a", "only_in_b", "warnings"])
+    assert "Last Midnight" in d["only_in_b"], "written for the 1990s London production, so on the 2002 album only"
+    assert not d["warnings"]
+    d = show("compare_recordings two different shows -> warning", compare_recordings("hamilton-2015", "wicked-2003"), ["warnings"])
+    assert d["warnings"]
+    d = show("get_recordings with two albums", get_recordings("hello-dolly-1995"), ["recordings"])
+    assert len(d["recordings"]) == 2
+
+    # Cast (hand-curated, may be empty)
+    d = show("get_cast_changes hamilton", get_cast_changes("hamilton-2015"))
+    assert "cast_changes" in d
+    d = show("get_cast_changes no filter -> error", get_cast_changes())
+    assert "error" in d
+
     print("\nall checks passed")

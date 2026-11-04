@@ -2,10 +2,13 @@
 
     uv run build_db.py
 
-Only grosses and Tonys exist so far, so this version creates *provisional* productions straight from
-grosses_runs.csv, and links Tony nominees to them with a provisional title-and-date match
-(match_awards_provisional). When link_shows.py exists it will write a canonical productions.csv
-(IBDB-backed) and the award links, and both provisional steps below go away. The rest stays the same.
+Productions come straight from grosses_runs.csv (one per run of weekly grosses), and Tony nominees,
+cast recordings and hand-curated cast changes are linked to them by title and date. There is no
+canonical production list behind this: IBDB, the obvious source, doesn't allow automated access. So
+type (original/revival) and opening dates stay guesses from the grosses, and broadway_data.py says so.
+
+Cast changes come only from data/csv/cast_changes_manual.csv, written by hand: one row per performer
+joining or leaving, each with a source_url. The file is optional; without it the cast table is empty.
 
 The database is disposable: delete it and rerun. Fix data in the CSVs or the ingest scripts,
 never in the .db file.
@@ -14,6 +17,7 @@ never in the .db file.
 import re
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -31,8 +35,8 @@ SCHEMA = ROOT / "schema.sql"
 # A production that has closed (not still open at the data's cutoff) after fewer than this many
 # weeks of grosses (previews included) counts as having closed early.
 # Closed runs in the 1985-2020 data have a median of 15 weeks, because many are limited-run plays
-# and special engagements. So this flags a lot at 26. Once IBDB gives each production a category,
-# apply the rule to musicals only, and pick the number from their distribution.
+# and special engagements. So this flags a lot at 26. A category (musical or play) for each production
+# would let the rule apply to musicals only; no source here has one for every production.
 CLOSED_EARLY_WEEKS = 26
 # ---------------------------------------------------------------------------
 
@@ -49,12 +53,12 @@ def provisional_productions(runs: pd.DataFrame) -> pd.DataFrame:
             "run_id": runs["run_id"],
             "title": runs["show"],
             # The first run of a title in this data is called the original, later ones revivals.
-            # Wrong for anything that opened before 1985 (the 1996 'Chicago' is a revival).
-            # link_shows.py replaces this from IBDB.
+            # Wrong for anything that opened before 1985 (the 1996 'Chicago' is a revival). A guess
+            # that stays: no source with full production records allows automated access.
             "type": runs.groupby("show").cumcount().map(lambda n: "original" if n == 0 else "revival"),
             "theater": runs["theatres"].str.split("; ").str[0],
             # Not known from grosses alone: the first week may be a preview week, and a run that
-            # begins in 1985-06 may have opened years before. IBDB fills these.
+            # begins in 1985-06 may have opened years before. So this stays unknown.
             "opening_date": None,
             "closing_date": runs["last_week"].where(runs["open_at_cutoff"] == 0),  # a week ending, not the last show
             "closed_early": None,
@@ -74,7 +78,7 @@ def provisional_productions(runs: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# PROVISIONAL TONY MATCH. One place; link_shows.py replaces it.
+# TONY MATCH. One place, so you can change it and rebuild.
 # A nominee links to a production when the folded titles are equal and the run was on Broadway
 # during that ceremony's season: it started on or before the ceremony and its last grosses week
 # is after the previous ceremony, less SEASON_SLACK_WEEKS (a show that opened in May and closed
@@ -117,7 +121,7 @@ def match_awards_provisional(awards: pd.DataFrame, prods: pd.DataFrame, cer: pd.
 
 
 # ---------------------------------------------------------------------------
-# PROVISIONAL RECORDING MATCH. One place; link_shows.py replaces it.
+# RECORDING MATCH. One place, so you can change it and rebuild.
 # A cast recording links to a production of the same (folded) title when its cast_year (from the
 # MusicBrainz disambiguation, e.g. '1996 Broadway revival cast', else the release year) is within
 # RECORDING_SLACK_YEARS of the run: albums are often recorded in previews, or come out after closing.
@@ -142,6 +146,77 @@ def match_recordings_provisional(rec: pd.DataFrame, prods: pd.DataFrame) -> pd.S
         ]
         out[i] = min(fits)[2] if fits else None
     return pd.Series(out, dtype=object)
+
+
+# ---------------------------------------------------------------------------
+# CAST MATCH. One place, so you can change it and rebuild.
+# A hand-curated cast change links to the production of the same (folded) title whose grosses run
+# includes its start_date, give or take CAST_SLACK_WEEKS (a star announced for opening night may start
+# in previews; a start_date can fall in a dark week). If several runs fit, the closest one wins.
+# A row that matches nothing stops the build: it's hand-written, so it's a typo to fix, not data to drop.
+CAST_SLACK_WEEKS = 2
+CAST_FILE = CSV / "cast_changes_manual.csv"
+CAST_COLUMNS = ["show_title", "person", "role", "start_date", "end_date", "is_star", "source_url"]
+# ---------------------------------------------------------------------------
+
+
+def load_cast_changes(prods: pd.DataFrame) -> pd.DataFrame:
+    """cast_changes_manual.csv -> rows for the cast_changes table, each with its production_id."""
+    cast = pd.read_csv(CAST_FILE, dtype=str).fillna("")
+    missing = [c for c in CAST_COLUMNS if c not in cast.columns]
+    assert not missing, f"{CAST_FILE.name} is missing columns {missing}; it needs {CAST_COLUMNS}"
+
+    by_title: dict[str, list] = {}
+    for p in prods.itertuples():
+        by_title.setdefault(fold(p.title), []).append(
+            (pd.Timestamp(p.first_week), pd.Timestamp(p.last_week), p.production_id)
+        )
+    slack = pd.Timedelta(weeks=CAST_SLACK_WEEKS)
+
+    problems, out = [], []
+    for i, r in cast.iterrows():
+        line = f"{CAST_FILE.name} line {i + 2} ({r['person']} in {r['show_title']})"  # +2: header, 1-based
+        row_problems = [f"{line}: {col} is empty"
+                        for col in ("show_title", "person", "start_date", "source_url") if not r[col].strip()]
+        try:
+            # Strictly YYYY-MM-DD: pandas would also take 'July 2000' and quietly pick July 1
+            start = pd.Timestamp(date.fromisoformat(r["start_date"].strip()))
+            end = pd.Timestamp(date.fromisoformat(r["end_date"].strip())) if r["end_date"].strip() else None
+        except ValueError:
+            problems += row_problems + [
+                f"{line}: dates must be YYYY-MM-DD, got {r['start_date']!r} / {r['end_date']!r}"]
+            continue
+        if end is not None and end < start:
+            row_problems.append(f"{line}: end_date is before start_date")
+        if r["is_star"].strip() not in ("", "0", "1"):
+            row_problems.append(f"{line}: is_star must be 0, 1 or empty, got {r['is_star']!r}")
+        if row_problems:
+            problems += row_problems
+            continue
+
+        runs = by_title.get(fold(r["show_title"]), [])
+        fits = [(0 if first <= start <= last else min(abs(start - first), abs(start - last)), pid)
+                for first, last, pid in runs if first - slack <= start <= last + slack]
+        if not fits:
+            spans = ", ".join(f"{pid} ({first.date()} to {last.date()})" for first, last, pid in runs) or "no production"
+            problems.append(f"{line}: no run of that title includes {start.date()}. Title matches: {spans}")
+            continue
+        pid = min(fits)[1]
+        first_week = next(first for first, _, p in runs if p == pid)
+        out.append({
+            "production_id": pid,
+            "person": r["person"].strip(),
+            "role": r["role"].strip() or None,
+            "start_date": start.date().isoformat(),
+            "end_date": end.date().isoformat() if end is not None else None,
+            # Someone starting more than CAST_SLACK_WEEKS after the run's first week replaced someone
+            "is_replacement": int(start > first_week + slack),
+            "is_star": int(r["is_star"]) if r["is_star"].strip() else None,
+            "source_url": r["source_url"].strip(),
+        })
+    assert not problems, "fix these rows in the cast file:\n  " + "\n  ".join(problems)
+    return pd.DataFrame(out, columns=["production_id", "person", "role", "start_date", "end_date",
+                                      "is_replacement", "is_star", "source_url"])
 
 
 def main() -> None:
@@ -231,6 +306,22 @@ def main() -> None:
         "Track lists are of one official release per recording, so bonus tracks on other editions may be missing. "
         "Off-Broadway, London and tour recordings are not included.')"
     )
+
+    # Cast changes (hand-curated; optional)
+    n_cast = 0
+    if CAST_FILE.exists():
+        cast = load_cast_changes(prods)
+        cast.to_sql("cast_changes", con, if_exists="append", index=False)
+        n_cast = len(cast)
+        if n_cast:
+            con.execute(
+                "INSERT INTO data_sources (source, description, covers_from, covers_to, fetched_at, notes) "
+                "VALUES ('cast', 'Cast changes: performers joining or leaving, hand-curated from news reports and "
+                "Wikipedia (each row has its own source_url)', ?, ?, date('now'), ?)",
+                (cast["start_date"].min(), cast["start_date"].max(),
+                 f"Only {n_cast} changes in {cast['production_id'].nunique()} productions, chosen by hand: most "
+                 "productions have none recorded, and a missing change doesn't mean it didn't happen."),
+            )
     con.commit()
 
     # Checks. Fail loudly rather than ship a database that quietly disagrees with its CSVs.
@@ -259,6 +350,10 @@ def main() -> None:
     assert n_t == len(tr), f"tracks rows {n_t} != linked CSV rows {len(tr)}"
     print(f"recordings: {n_r:,} of {len(rec):,} linked to a production, {n_t:,} tracks "
           f"(unlinked are mostly casts from before the grosses data)")
+
+    n_c = con.execute("SELECT COUNT(*) FROM cast_changes").fetchone()[0]
+    assert n_c == n_cast, f"cast_changes rows {n_c} != linked CSV rows {n_cast}"
+    print(f"cast changes: {n_c:,}" + ("" if CAST_FILE.exists() else f" ({CAST_FILE.name} not found: optional)"))
     con.close()
 
 
