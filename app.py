@@ -12,7 +12,7 @@ from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_too
 from agents.extensions.models.litellm_model import LitellmModel
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import broadway_data as db
@@ -97,6 +97,14 @@ class ToolCallHooks(PanelHooks):
         except (TypeError, ValueError):
             args = {"raw": raw}
         self.tool_calls.append({"agent": agent.name, "name": tool.name, "args": args, "result": str(result)})
+        # The page draws a box office chart for each production a Fate pulls grosses for
+        if tool.name in CHART_TOOLS and isinstance(args.get("production_id"), str):
+            self.emit({"type": "chart", "agent": agent.name, "production_id": args["production_id"],
+                       "date": args.get("date")})
+
+
+# Tools whose production the page charts (see /api/grosses)
+CHART_TOOLS = {"get_grosses", "grosses_around_date"}
 
 
 # --- Tools: thin wrappers over broadway_data, which does the queries and all the arithmetic ---
@@ -612,6 +620,23 @@ def index():
     return FileResponse(HERE / "index.html", headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/api/grosses")
+def grosses_series(production_id: str):
+    """One production's weekly grosses, for the page's box office chart. Dark weeks are left out."""
+    try:
+        p = db._production(production_id)
+    except KeyError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    rows = db.grosses_rows(production_id)
+    return {
+        "production_id": production_id,
+        "title": p["title"],
+        "weeks": [{"week_ending": r["week_ending"], "gross": r["gross"], "capacity_pct": r["capacity_pct"],
+                   "preview": r["preview_week"]} for r in rows],
+        "source_url": rows[0]["source_url"] if rows else None,
+    }
+
+
 @app.get("/run")
 async def run(question: str):
     """Research one question and stream what happens as Server-Sent Events."""
@@ -623,9 +648,9 @@ async def run(question: str):
     async def work():
         try:
             text, clarifying = await deep_research(question, hooks)
-            # The page has no session: a clarifying question is shown, and the user asks again in full
-            markdown = f"**Before I research this:** {text}" if clarifying else text
-            queue.put_nowait({"type": "done", "markdown": markdown})
+            # clarifying: text is Barfee's (or Glinda's) question, not a report. The page asks the user, then
+            # sends "Original question: ... / User's clarification: ..." as a new run, as /chat does.
+            queue.put_nowait({"type": "done", "markdown": text, "clarifying": clarifying})
         except Exception as e:
             # Auth, quota, a model that won't stop: show it on the page, not as a dropped stream.
             queue.put_nowait({"type": "error", "message": f"{type(e).__name__}: {str(e)[:500]}"})
