@@ -35,8 +35,8 @@ SCHEMA = ROOT / "schema.sql"
 # A production that has closed (not still open at the data's cutoff) after fewer than this many
 # weeks of grosses (previews included) counts as having closed early.
 # Closed runs in the 1985-2020 data have a median of 15 weeks, because many are limited-run plays
-# and special engagements. So this flags a lot at 26. A category (musical or play) for each production
-# would let the rule apply to musicals only; no source here has one for every production.
+# and special engagements. So this flags a lot at 26. Only productions running from 2018 on have a
+# category (musical or play, from IST719), so the rule can't be limited to musicals across the data.
 CLOSED_EARLY_WEEKS = 26
 # ---------------------------------------------------------------------------
 
@@ -60,6 +60,8 @@ def provisional_productions(runs: pd.DataFrame) -> pd.DataFrame:
             # Not known from grosses alone: the first week may be a preview week, and a run that
             # begins in 1985-06 may have opened years before. So this stays unknown.
             "opening_date": None,
+            # musical / play / special, from IST719: only for runs with weeks from 2018-08 on, else unknown
+            "category": runs["category"] if "category" in runs else None,
             "closing_date": runs["last_week"].where(runs["open_at_cutoff"] == 0),  # a week ending, not the last show
             "closed_early": None,
         }
@@ -236,7 +238,7 @@ def main() -> None:
     con.executescript(SCHEMA.read_text())
 
     # productions
-    cols = ["production_id", "title", "type", "theater", "opening_date", "closing_date", "closed_early"]
+    cols = ["production_id", "title", "type", "category", "theater", "opening_date", "closing_date", "closed_early"]
     prods[cols].to_sql("productions", con, if_exists="append", index=False)
 
     # aliases: the grosses file's own spelling of each title
@@ -257,9 +259,12 @@ def main() -> None:
 
     con.execute(
         "INSERT INTO data_sources (source, description, covers_from, covers_to, fetched_at, notes) "
-        "VALUES ('grosses', 'Weekly Broadway grosses (Tidy Tuesday dataset, credited to Playbill)', ?, ?, "
-        "date('now'), 'Ends at the 2020 shutdown. potential_gross missing in the 1980s and most of the 1990s. "
-        "Broadway only: tours are not included. Preview weeks are in the data.')",
+        "VALUES ('grosses', 'Weekly Broadway grosses, from Playbill via two datasets: Tidy Tuesday (to 2020-03-01) "
+        "and IST719 BroadwayGrosses (2020-03-08 on)', ?, ?, date('now'), "
+        "'No grosses during the COVID shutdown: Broadway closed 2020-03-12 and shows reopened from August 2021, "
+        "so there are no weeks between 2020-03-08 and 2021-08. Shows playing at the shutdown that reopened "
+        "continue as one production. potential_gross (and so gross-to-potential) is missing in the 1980s, most "
+        "of the 1990s, and from 2020 on. Broadway only: tours are not included. Preview weeks are in the data.')",
         (g["week_ending"].min(), g["week_ending"].max()),
     )
 
@@ -339,8 +344,9 @@ def main() -> None:
 
     n_a = con.execute("SELECT COUNT(*) FROM awards").fetchone()[0]
     assert n_a == len(awards), f"awards rows {n_a} != CSV rows {len(awards)}"
-    # Grosses end in March 2020, so only ceremonies through 2021 can match. Later ones wait for new grosses.
-    for label, where in (("1985-2021", "year <= 2021"), ("2022-2026", "year > 2021")):
+    # Grosses end in March 2023, so ceremonies through 2023 can match (for shows running by then).
+    # Later ones wait for new grosses.
+    for label, where in (("1985-2023", "year <= 2023"), ("2024-2026", "year > 2023")):
         linked, total = con.execute(
             f"SELECT COUNT(production_id), COUNT(*) FROM awards WHERE {where}"
         ).fetchone()

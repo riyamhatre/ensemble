@@ -22,6 +22,7 @@ Smoke test: uv run nyt.py [title]   (offline checks always; a live call too if t
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import date, timedelta
@@ -44,6 +45,19 @@ DAILY_LIMIT = 500
 MAX_ARTICLES = 10  # one page of results; each further page is another 12.5 s request
 
 ATTRIBUTION = "Data provided by The New York Times"
+
+# Reviews come out around opening night, so get_press(reviews_only=True) searches this window around the
+# production's first week of grosses (usually its first preview), not the whole run: over a long run the
+# top results by relevance are news, and the opening review never makes the first page.
+REVIEW_DAYS_BEFORE = 60   # a show that starts in the data mid-previews
+REVIEW_DAYS_AFTER = 150   # previews to opening can take a few months
+
+# Filters that ask the API for reviews only, tried in order. NOT VERIFIED against current docs: the
+# classic Article Search field is type_of_material; newer docs may name it typeOfMaterials. The first
+# one that returns reviews is remembered for the rest of the process. If none works (a 400, or no
+# reviews), search_articles falls back to an unfiltered search and keeps the reviews in it.
+REVIEW_FILTERS = ['type_of_material:("Review")', 'typeOfMaterials:("Review")']
+_review_filter = {"working": None}
 
 _cache: dict[tuple, tuple[float, list[dict]]] = {}  # query -> (fetched at, articles). Memory only.
 _lock = threading.Lock()  # the agents call tools from several threads; one request at a time
@@ -73,7 +87,7 @@ def parse_docs(body: dict) -> list[dict]:
     for d in docs:
         headline = d.get("headline")
         headline = headline.get("main") if isinstance(headline, dict) else headline
-        material = d.get("type_of_material") or ""
+        material = d.get("type_of_material") or d.get("typeOfMaterial") or ""
         section = d.get("section_name") or ""
         out.append(
             {
@@ -87,6 +101,10 @@ def parse_docs(body: dict) -> list[dict]:
             }
         )
     return out
+
+
+class BadQuery(RuntimeError):
+    """The API rejected the query itself (HTTP 400), e.g. a filter field it doesn't know."""
 
 
 def _request(params: dict) -> dict:
@@ -110,6 +128,8 @@ def _request(params: dict) -> dict:
         raise RuntimeError(f"NYT request failed: {type(e).__name__}") from None  # httpx's text has the URL
     if r.status_code == 429:
         raise RuntimeError("NYT rate limit hit (429): wait a minute, or the daily cap is used up")
+    if r.status_code == 400:
+        raise BadQuery("NYT rejected the query (400)")
     if r.status_code in (401, 403):
         raise RuntimeError(f"NYT refused the key ({r.status_code}): check NYT_API_KEY and that Article Search is enabled")
     if r.is_error:
@@ -117,8 +137,8 @@ def _request(params: dict) -> dict:
     return r.json()
 
 
-def _search(title: str, start: str | None, end: str | None) -> list[dict]:
-    key = (title.lower(), start, end)
+def _search(title: str, start: str | None, end: str | None, fq: str | None = None) -> list[dict]:
+    key = (title.lower(), start, end, fq)
     now = time.time()
     with _lock:
         # Drop everything past its TTL, not just this key: nothing may outlive 24 hours
@@ -127,6 +147,8 @@ def _search(title: str, start: str | None, end: str | None) -> list[dict]:
         if key in _cache:
             return _cache[key][1]
         params = {"q": f'"{title}" Broadway', "sort": "relevance"}
+        if fq:
+            params["fq"] = fq
         if start:
             params["begin_date"] = _yyyymmdd(start)
         if end:
@@ -136,21 +158,72 @@ def _search(title: str, start: str | None, end: str | None) -> list[dict]:
         return articles
 
 
+def _fold(text: str) -> str:
+    """Lowercase, curly quotes and punctuation out: for matching a show's title in a headline."""
+    return " " + re.sub(r"[^a-z0-9]+", " ", (text or "").lower().replace("\u2019", "'").replace("'", "")).strip() + " "
+
+
+def _names_show(article: dict, title: str) -> bool:
+    """The headline names the show ('Review: 'Hamilton,' Young Rebels...'), not just mentions it in the text."""
+    return _fold(title) in _fold(article.get("headline") or "")
+
+
+def _about_show(articles: list[dict], title: str, reviews_only: bool) -> tuple[list[dict], bool]:
+    """The search matches the title anywhere in an article, so other shows' reviews come back too.
+    Articles naming the show in the headline go first, Theater section first among them. For reviews,
+    only those are kept when there are any. Returns the articles, and whether any named the show."""
+    named = [a for a in articles if _names_show(a, title)]
+    named.sort(key=lambda a: a.get("section") != "Theater")  # stable: relevance order otherwise
+    if reviews_only:
+        # A book about Alexander Hamilton names 'Hamilton' too: when there's a theater review, keep only those
+        theater = [a for a in named if a.get("section") == "Theater"]
+        return (theater or named, True) if named else (articles, False)
+    return named + [a for a in articles if a not in named], bool(named)
+
+
+def _reviews(title: str, start: str | None, end: str | None) -> tuple[list[dict], str]:
+    """Reviews only: ask the API with a review filter (the one that worked before first), else search
+    unfiltered and keep the reviews. Returns the articles and how they were found."""
+    filters = REVIEW_FILTERS
+    if _review_filter["working"]:
+        filters = [_review_filter["working"]] + [f for f in REVIEW_FILTERS if f != _review_filter["working"]]
+    for fq in filters:
+        try:
+            found = [a for a in _search(title, start, end, fq) if a["is_review"]]
+        except BadQuery:
+            continue  # the API doesn't know this field name: try the next
+        if found:
+            _review_filter["working"] = fq
+            return found, f"filter {fq}"
+    return [a for a in _search(title, start, end) if a["is_review"]], "unfiltered search, reviews kept"
+
+
 def search_articles(title: str, start: str | None = None, end: str | None = None, reviews_only: bool = False) -> str:
     """NYT articles mentioning the title and Broadway between start and end (ISO dates), as JSON."""
     try:
-        articles = _search(title, start, end)
         if reviews_only:
-            articles = [a for a in articles if a["is_review"]]
+            articles, how = _reviews(title, start, end)
+        else:
+            articles, how = _search(title, start, end), "search"
+        articles, named = _about_show(articles, title, reviews_only)
+        notes = [
+            ATTRIBUTION + ". Looked up live; not stored. Cite each article by its web_url.",
+            "Only the top results by relevance are returned, so this is a sample of the coverage, "
+            "not all of it. Headlines and abstracts only, never the article text.",
+        ]
+        if articles and not named:
+            notes.append(f"None of these name '{title}' in the headline: they may be about other shows that "
+                         "mention it. Don't report them as coverage of this show.")
+        elif not reviews_only and named:
+            notes.append("Articles naming the show in the headline come first; the rest only mention it.")
+        if reviews_only and not articles:
+            notes.append("No review found in this window. That doesn't mean the Times didn't review it: "
+                         "the search returns a sample, and the review may fall outside these dates.")
         return json.dumps(
             {
-                "query": {"title": title, "start": start, "end": end, "reviews_only": reviews_only},
+                "query": {"title": title, "start": start, "end": end, "reviews_only": reviews_only, "found_by": how},
                 "articles": articles[:MAX_ARTICLES],
-                "notes": [
-                    ATTRIBUTION + ". Looked up live; not stored. Cite each article by its web_url.",
-                    "Only the top results by relevance are returned, so this is a sample of the coverage, "
-                    "not all of it. Headlines and abstracts only, never the article text.",
-                ],
+                "notes": notes,
             }
         )
     except Exception as e:
@@ -159,13 +232,19 @@ def search_articles(title: str, start: str | None = None, end: str | None = None
 
 def get_press(production_id: str, reviews_only: bool = False) -> str:
     """NYT coverage of one production: from 4 months before its first week of grosses (previews and
-    advance press) to a month after its last week."""
+    advance press) to a month after its last week. With reviews_only, just the weeks around opening
+    (REVIEW_DAYS_BEFORE / REVIEW_DAYS_AFTER the first week), where the reviews are."""
     try:
         import broadway_data as db  # here, not at the top: nyt.py works on its own without the database
 
         p = db._production(production_id)
-        start = (date.fromisoformat(p["first_week"]) - timedelta(days=120)).isoformat()
-        end = (date.fromisoformat(p["last_week"]) + timedelta(days=30)).isoformat()
+        first = date.fromisoformat(p["first_week"])
+        if reviews_only:
+            start = (first - timedelta(days=REVIEW_DAYS_BEFORE)).isoformat()
+            end = min(first + timedelta(days=REVIEW_DAYS_AFTER), date.fromisoformat(p["last_week"]) + timedelta(days=30)).isoformat()
+        else:
+            start = (first - timedelta(days=120)).isoformat()
+            end = (date.fromisoformat(p["last_week"]) + timedelta(days=30)).isoformat()
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"})
     out = json.loads(search_articles(p["title"], start, end, reviews_only))
@@ -202,6 +281,35 @@ if __name__ == "__main__":
     if saved is not None:
         os.environ["NYT_API_KEY"] = saved
     assert "error" in json.loads(get_press("no-such-show"))
+
+    # Review search, with the API faked: the first filter name is rejected (400), the second works
+    real_request, seen = _request, []
+    def fake(params):
+        seen.append(params.get("fq"))
+        if params.get("fq") == REVIEW_FILTERS[0]:
+            raise BadQuery("NYT rejected the query (400)")
+        return sample
+    _request = fake
+    os.environ.setdefault("NYT_API_KEY", "offline-test")
+    out = json.loads(search_articles("Test Show", "2015-01-01", "2015-12-31", reviews_only=True))
+    assert [a["is_review"] for a in out["articles"]] == [1] and out["query"]["found_by"] == f"filter {REVIEW_FILTERS[1]}"
+    assert seen == REVIEW_FILTERS and _review_filter["working"] == REVIEW_FILTERS[1]
+    out = json.loads(search_articles("Other Show", reviews_only=True))  # the working filter is tried first now
+    assert seen[-1] == REVIEW_FILTERS[1] and len(seen) == 3
+    clear_cache(); _review_filter["working"] = None; _request = real_request
+    if os.environ.get("NYT_API_KEY") == "offline-test":
+        del os.environ["NYT_API_KEY"]
+    # Reviews of other shows that mention the title in the text are dropped (shapes from a live run)
+    mixed = [
+        {"headline": "John Sedgwick's 'War of Two: Alexander Hamilton, Aaron Burr'", "section": "Books", "is_review": 1},
+        {"headline": "Review: \u2018Hamilton,\u2019 Young Rebels Changing History and Theater", "section": "Theater", "is_review": 1},
+        {"headline": "Review: 'Saturday Night Fever: The Musical' at Gateway Is Old but New", "section": "New York", "is_review": 1},
+    ]
+    kept, named = _about_show(mixed, "Hamilton", reviews_only=True)
+    assert named and [a["section"] for a in kept] == ["Theater"], kept
+    kept, named = _about_show(mixed[2:], "Hamilton", reviews_only=True)
+    assert not named and len(kept) == 1  # nothing names it: kept, and the notes warn
+    assert not _names_show({"headline": "Hamlet review"}, "Hamilton") and _names_show({"headline": "RENT, revived"}, "Rent")
     print("offline checks passed")
 
     if not os.environ.get("NYT_API_KEY", "").strip():

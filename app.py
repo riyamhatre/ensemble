@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 import broadway_data as db
+import nyt
 import wikipedia
 from context_panel import AgentContexts, PanelHooks, add_context_panel
 
@@ -52,12 +53,23 @@ def coverage_text() -> str:
     for s in cov["sources"]:
         dates = f" ({s['covers_from']} to {s['covers_to']})" if s.get("covers_from") else ""
         lines.append(f"- {s['source']}: {s['description']}{dates}. {s.get('notes') or ''}".rstrip())
+    # The NYT isn't in the database (its terms forbid storing it), so data_sources doesn't list it
+    if os.environ.get("NYT_API_KEY", "").strip():
+        lines.append(
+            "- press: New York Times articles (headline, date, abstract, link; whether it's a review), looked "
+            "up live through the NYT Article Search API and never stored. Only the top results by relevance, "
+            "so a sample of the coverage, not all of it. No full article text."
+        )
+    else:
+        lines.append("- press: New York Times articles are not available on this server (no API key set).")
     lines.append("- Not in the data at all: " + ", ".join(cov["not_available"]) + ".")
     return "\n".join(lines)
 
 
 # The database is a read-only snapshot, so reading its coverage once at startup is enough
 COVERAGE = coverage_text()
+# The last week of grosses, for prompts that need to name it
+GROSSES_END = next(s["covers_to"] for s in json.loads(db.data_coverage())["sources"] if s["source"] == "grosses")
 
 
 @dataclass
@@ -220,6 +232,36 @@ def get_cast_changes(production_id: str | None = None, person_contains: str | No
     return db.get_cast_changes(production_id, person_contains)
 
 
+# NYT tools: live calls, at most one every 12.5 seconds (nyt.py enforces it), so keep them few.
+
+
+@function_tool
+def get_press(production_id: str, reviews_only: bool = False) -> str:
+    """New York Times articles about one production, from about 4 months before its first week to a
+    month after its last: headline, date, abstract, link, and whether it's a review. The top results
+    by relevance only. Takes about 12 seconds.
+
+    Args:
+        production_id: From find_production.
+        reviews_only: True for reviews only.
+    """
+    return nyt.get_press(production_id, reviews_only)
+
+
+@function_tool
+def search_nyt(title: str, start: str | None = None, end: str | None = None, reviews_only: bool = False) -> str:
+    """New York Times articles mentioning a show's title and Broadway between two dates. Use it for a
+    narrower window than get_press gives (the weeks around an event). Takes about 12 seconds.
+
+    Args:
+        title: The show's title, e.g. 'Hamilton'.
+        start: Optional earliest publish date, ISO 'YYYY-MM-DD'.
+        end: Optional latest publish date, ISO 'YYYY-MM-DD'.
+        reviews_only: True for reviews only.
+    """
+    return nyt.search_articles(title, start, end, reviews_only)
+
+
 @function_tool
 def get_article(title_or_url: str) -> str:
     """Get the text of an English Wikipedia article: for background on a show (its story, its history),
@@ -293,8 +335,25 @@ Make at most 4 tool calls.""",
 3. If nothing is recorded, say the date isn't in the data: never guess one.
 Make at most 3 tool calls.""",
     },
+    "press": {
+        "about": "New York Times coverage (live): reviews and news, with dates; the date a show was "
+                 "reviewed; how critics received it",
+        "tools": [find_production, get_press, search_nyt],
+        "how": """\
+1. You're given a production_id. If not, find it with find_production.
+2. Call get_press with the production_id. For how critics received a show, or the date of its
+   review, set reviews_only to true. Use search_nyt only for a narrower window (the weeks around an
+   event) than get_press covers.
+3. Report each relevant article as its headline, its pub_date and its abstract in one line, linked
+   to its web_url, e.g. [NYT, 2015-08-06: Review: 'Hamilton,' Young Rebels Changing History](web_url).
+   For a review's date, give the pub_date of the review itself.
+4. Say what the abstracts say; don't characterize a review beyond them. They are a sample of the
+   coverage (the top results by relevance), not all of it.
+5. Each call takes about 12 seconds: make at most 2 tool calls. If a tool says the NYT isn't
+   available (no API key, rate limit), don't call it again: report the gap.""",
+    },
 }
-Source = Literal["grosses", "awards", "music", "cast"]  # keep in step with SOURCES' keys
+Source = Literal["grosses", "awards", "music", "cast", "press"]  # keep in step with SOURCES' keys
 SOURCE_LIST = "\n".join(f"- {name}: {s['about']}" for name, s in SOURCES.items())
 
 
@@ -316,7 +375,7 @@ period, or when the time period obviously doesn't matter ("What was Hamilton's b
   2 or 3 concrete options, e.g. "CLARIFY: Over which years, and do you mean box office or awards?"
 - A question about which shows are in trouble or struggling needs a week. If it says "now" or gives
   none, ask, offering the last week of the grosses data as one option, e.g. "CLARIFY: The grosses data
-  ends in March 2020. Do you mean the last weeks before the shutdown, or a specific earlier date?"
+  ends {GROSSES_END}. Do you mean the last weeks of the data, or a specific earlier date?"
 - If it's ready, reply RESEARCH: followed by the question, rewritten to be specific.
   Don't add facts or assumptions the user didn't give you.
 - If it isn't about Broadway, reply CLARIFY: and say in one sentence what you can help with.
@@ -430,8 +489,12 @@ Sources (pass one as `source` to research):
    - A performer joining or leaving: send a cast task for the date first, and the grosses task once
      you have it. If the cast task finds no date, don't guess one: the writer will say it isn't in
      the data, unless the user gave the date themselves.
+   - A New York Times review: send a press task for the review's date first (reviews only), and
+     the grosses task once you have it.
 4. For songs cut or added between productions, send one music task with both production_ids, the
    earlier first. Off-Broadway and London productions aren't in the data.
+   For how critics or the press received a show, or news about it, send a press task. Press
+   tasks take longer (each NYT lookup is about 12 seconds): send at most two in a run.
 5. Split the question into 1 to 4 independent tasks and call research once per task, all in the
    same turn, so the researchers work in parallel. Pick each task's source, and put the
    production_id and any dates in the task. The writer sees only the researchers' findings, never
@@ -471,6 +534,9 @@ Write a short report in markdown that answers the question, using only the findi
   say it's an association, not proof the award caused the change.
 - For songs between productions: list what was cut and what was added, and say the comparison is
   of the cast albums, which can leave songs out.
+- For New York Times coverage: link each article as its finding does, describe reviews only as far
+  as their abstracts go, and never quote more than a headline. If the report uses any NYT article,
+  end it with the line "Data provided by The New York Times" (the NYT API's terms ask for it).
 - Pass on the findings' warnings where they bear on the answer. If findings disagree, say so
   rather than picking one.
 - Summarize: no week-by-week lists, and no notes on method beyond one sentence saying what the

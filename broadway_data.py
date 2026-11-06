@@ -47,6 +47,9 @@ TROUBLE_GROSS_VS_MARKET = -10.0  # average weekly gross
 TROUBLE_TICKET_VS_MARKET = -5.0  # average ticket price: a show cutting prices faster than the market
 # Closed productions in this many years before the week make the "how shows look before closing" benchmark
 TROUBLE_BENCHMARK_YEARS = 5
+# The shutdown and the reopening, when COVID kept audiences down (Omicron closed shows again in the winter
+# of 2021-22). Year-on-year comparisons against weeks in here say more about COVID than about a show.
+COVID_DISRUPTED = ("2020-03-12", "2022-05-31")
 
 
 def _connect() -> sqlite3.Connection:
@@ -332,6 +335,17 @@ def _around(production_id: str, date_: str, weeks_before: int = 8, weeks_after: 
                  for m in market_change}
 
     warnings = []
+    # The windows are the show's nearest weeks with data, so a long dark stretch (the COVID shutdown, a
+    # hiatus) can push one far from the date. Say so: it compares across the gap, not a before/after.
+    before_span = (event - date.fromisoformat(before[0]["week_ending"])).days / 7 if before else 0
+    after_span = (date.fromisoformat(after[-1]["week_ending"]) - event).days / 7 if after else 0
+    crosses_gap = before_span > 2 * weeks_before + 2 or after_span > 2 * weeks_after + 2
+    if crosses_gap:
+        warnings.append(
+            f"the windows reach {before[0]['week_ending'] if before else '?'} to {after[-1]['week_ending'] if after else '?'}: "
+            "the show was dark for a long stretch near this date (e.g. the 2020-21 COVID shutdown), so this "
+            "compares across that gap rather than just before and after the date"
+        )
     if show_b["weeks"] < weeks_before:
         warnings.append(f"only {show_b['weeks']} of {weeks_before} weeks before the date have data")
     if show_a["weeks"] < weeks_after:
@@ -354,6 +368,7 @@ def _around(production_id: str, date_: str, weeks_before: int = 8, weeks_after: 
         "after": {"from": after[0]["week_ending"] if after else None,
                   "to": after[-1]["week_ending"] if after else None, **show_a},
         "event_week": event_week[0]["week_ending"] if event_week else None,
+        "crosses_long_gap": crosses_gap,
         "pct_change": change,
         "market_pct_change": market_change,
         "pct_change_vs_market": vs_market,
@@ -488,8 +503,10 @@ def trouble_signals(week_ending: str | None = None, weeks: int = 8) -> dict:
     if len(recent) < weeks:
         raise ValueError(f"not enough weeks of data on or before {week_ending}")
     week = recent[-1]
-    # The same Sundays a year earlier (52 weeks back), for year-over-year trends
+    # The same Sundays a year earlier (52 weeks back), for year-over-year trends. None at all when those
+    # weeks fall in the shutdown or the reopening: every show looks up or down against COVID, not its market.
     year_ago = [(date.fromisoformat(w) - timedelta(weeks=52)).isoformat() for w in recent]
+    covid_year = any(COVID_DISRUPTED[0] <= w <= COVID_DISRUPTED[1] for w in year_ago)
 
     # Benchmark: how far closing productions trailed the market in their final weeks
     start = date.fromisoformat(week) - timedelta(days=365 * TROUBLE_BENCHMARK_YEARS)
@@ -516,7 +533,7 @@ def trouble_signals(week_ending: str | None = None, weeks: int = 8) -> dict:
 
     mkt_now = _market_levels(recent)
     yb, ya, n_market = _market(year_ago, recent, "")
-    market_yoy = {m: _pct_change(yb[m], ya[m]) for m in ("avg_weekly_gross", "avg_ticket")}
+    market_yoy = {m: None if covid_year else _pct_change(yb[m], ya[m]) for m in ("avg_weekly_gross", "avg_ticket")}
 
     running = _rows(
         f"SELECT g.production_id, p.title FROM grosses g JOIN productions p USING (production_id) "
@@ -533,7 +550,7 @@ def trouble_signals(week_ending: str | None = None, weeks: int = 8) -> dict:
         cap_vs = _minus(now["capacity_pct"], mkt["capacity_pct"])
         g2p_vs = _minus(now["gross_to_potential"], mkt["gross_to_potential"], 3)
 
-        has_year = len(then) >= weeks / 2
+        has_year = len(then) >= weeks / 2 and not covid_year
         sb = _window_stats(then)
         gross_yoy = _pct_change(sb["avg_weekly_gross"], now["avg_weekly_gross"]) if has_year else None
         ticket_yoy = _pct_change(sb["avg_ticket"], now["avg_ticket"]) if has_year else None
@@ -587,6 +604,11 @@ def trouble_signals(week_ending: str | None = None, weeks: int = 8) -> dict:
             "Signals are warning signs, not predictions: a limited engagement closes on schedule whatever it grosses, "
             "and a strong show can still close when its theater is booked.",
             "Shows with under a year of grosses have no year-on-year trend; a show in previews sells below a running one.",
+        ] + ([
+            f"No year-on-year trends for this week: a year earlier falls in the COVID shutdown or reopening "
+            f"({COVID_DISRUPTED[0]} to {COVID_DISRUPTED[1]}), when audiences were down for reasons that weren't the shows'. "
+            "Only level signals (selling below the market now) are given."
+        ] if covid_year else []) + [
             "level_signals: selling below the market now, by more than closing shows typically did. "
             "trend_signals: falling faster than the market on a year earlier. A trend signal on a show still "
             "selling above the market's capacity usually means prices coming down from a peak, not trouble.",
@@ -627,7 +649,8 @@ def tony_effect(category: str, from_year: int | None = None, to_year: int | None
     if not noms:
         raise ValueError(
             f"no nominees for category '{category}' in those years are linked to a production with grosses. "
-            "Nominees after 2021 aren't linked (grosses end in March 2020). Check the category name with get_awards."
+            f"Grosses end {_source('grosses').get('covers_to')}, so later ceremonies' nominees aren't linked. "
+            "Check the category name with get_awards."
         )
 
     data_start = date.fromisoformat(_source("grosses").get("covers_from"))
@@ -650,6 +673,8 @@ def tony_effect(category: str, from_year: int | None = None, to_year: int | None
             excluded.append({**base, "reason": f"only {r['before']['weeks']} weeks before and {r['after']['weeks']} after"})
         elif mostly_previews:
             excluded.append({**base, "reason": "most of the weeks before the ceremony were previews"})
+        elif r["crosses_long_gap"]:
+            excluded.append({**base, "reason": "the show was dark for a long stretch around the ceremony (e.g. the shutdown)"})
         else:
             included.append({**base, "gross_pct_change": r["pct_change"]["avg_weekly_gross"],
                              "gross_pct_change_vs_market": vs,
@@ -690,7 +715,8 @@ def tony_effect(category: str, from_year: int | None = None, to_year: int | None
             "Changes are against the market (same-store, as in grosses_around_date), in percentage points.",
             "This is an association, not proof the award caused it: winners were often already the stronger "
             "sellers, and nominations alone can lift a show before the ceremony.",
-            f"Grosses end {data_end}, so ceremonies after 2019 can't be measured.",
+            f"Grosses end {data_end}, so a ceremony is only measured when its {weeks} weeks after are all before then.",
+            "No ceremony is measured across the COVID shutdown: 2021's (September) has no weeks before it.",
         ],
         "source_url": _rows("SELECT source_url FROM grosses LIMIT 1")[0]["source_url"],
     }
@@ -893,8 +919,23 @@ if __name__ == "__main__":
     hamilton = [p for p in d["productions"] if p["production_id"] == "hamilton-2015"][0]
     same = json.loads(grosses_around_date("hamilton-2015", "2016-06-12"))["pct_change_vs_market"]["avg_weekly_gross"]
     assert hamilton["gross_pct_change_vs_market"] == same, "tony_effect must agree with grosses_around_date"
-    d = show("tony_effect 2022+ -> error (not linked)", tony_effect("Best Musical", 2022, 2026))
+    d = show("tony_effect 2024+ -> error (after the grosses end)", tony_effect("Best Musical", 2024, 2026))
     assert "error" in d
+    d = show("tony_effect 2022 (after the reopening)", tony_effect("Best Musical", 2022, 2022), ["winners", "excluded"])
+    assert [p["production_id"] for p in d["productions"] if p["won"]] == ["a-strange-loop-2022"]
+
+    # Data from 2020 on (IST719)
+    d = show("grosses_around_date across the shutdown -> warned", grosses_around_date("hamilton-2015", "2021-09-14"),
+             ["before", "after", "crosses_long_gap", "warnings"])
+    assert d["crosses_long_gap"] and any("shutdown" in w for w in d["warnings"])
+    d = json.loads(trouble_signals("2023-03-12"))
+    print("\n== trouble_signals, 2023-03-12: level signals:", [s["production_id"] for s in d["shows"] if s["level_signals"]])
+    assert not any(s["trend_signals"] for s in d["shows"]), "a year earlier is the reopening: no trends"
+    assert any("COVID" in n for n in d["notes"])
+    for hit in ("hamilton-2015", "wicked-2003", "six-the-musical-2020"):
+        assert not [s for s in d["shows"] if s["production_id"] == hit][0]["level_signals"], hit
+    six = json.loads(find_production("six"))["candidates"][0]
+    assert six["production_id"] == "six-the-musical-2020" and six["category"] == "musical" and six["running_at_data_end"]
 
     # Music
     d = show("compare_recordings Into the Woods 1987 vs 2002", compare_recordings("into-the-woods-1987", "into-the-woods-2002"),

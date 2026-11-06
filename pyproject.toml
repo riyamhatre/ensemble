@@ -1,7 +1,7 @@
 [project]
-name = "wikipedia-deep-research"
+name = "ensemble"
 version = "0.1.0"
-description = "Deep research over Wikipedia: a lead fans out researchers that walk Wikipedia's links, then a writer turns their findings into a cited report"
+description = "Box office detective: a deep research agent over Broadway grosses, Tony Awards and cast recordings"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.109.0",
