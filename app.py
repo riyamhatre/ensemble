@@ -585,14 +585,14 @@ async def deep_research(question: str, hooks: PanelHooks) -> tuple[str, bool]:
     today = f"Today's date: {now.isoformat()} (current Broadway season: {broadway_season(now)})"
 
     # 0. Triage: a vague question gets a clarifying question back instead of a report
-    verdict = str((await Runner.run(triage, f"{today}\n\n{question}", context=research_run, hooks=hooks, max_turns=1)).final_output).strip()
+    verdict = str((await Runner.run(triage, f"{today}\n\n{question}", context=research_run, hooks=hooks, max_turns=10)).final_output).strip()
     if verdict.upper().startswith(CLARIFY):
         return _after_clarify(verdict), True
     if verdict.upper().startswith("RESEARCH:"):
         question = _after_clarify(verdict) or question
 
     # 1. Research: identify the show, fan out, check for gaps
-    lead_result = await Runner.run(lead, f"{today}\nQuestion: {question}", context=research_run, hooks=hooks, max_turns=12)
+    lead_result = await Runner.run(lead, f"{today}\nQuestion: {question}", context=research_run, hooks=hooks, max_turns=100)
     answer = str(lead_result.final_output).strip()
     if answer.upper().startswith(CLARIFY):
         return _after_clarify(answer), True
