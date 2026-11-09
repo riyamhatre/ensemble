@@ -400,7 +400,7 @@
                     <button class="stub" type="button" role="listitem" data-q="Do Tony wins help box office more than nominations for Best Musical?"><b>The Tony bump</b><span>Do Tony wins help box office more than nominations for Best Musical?</span></button>
                     <button class="stub" type="button" role="listitem" data-q="Which songs were added to Into the Woods in the 2002 revival?"><b>Songs that changed</b><span>Which songs were added to Into the Woods in the 2002 revival?</span></button>
                     <button class="stub" type="button" role="listitem" data-q="Which shows were in trouble just before the data ends in March 2023?"><b>After the reopening</b><span>Which shows were in trouble just before the data ends in March 2023?</span></button>
-                    <button class="stub" type="button" role="listitem" data-q="How's Wicked doing?"><b>Something vague</b><span>How's Wicked doing? (Barfee will ask what you mean.)</span></button>
+                    <button class="stub" type="button" role="listitem" data-q="How's Wicked doing?"><b>Something vague</b><span>How's Wicked doing? (Barfee will ask you to BE SPECIFIC)</span></button>
                 </div>
             </section>
 
@@ -797,7 +797,7 @@
                 box.hidden = false;
                 box.innerHTML = `
                     <section class="bubble" aria-labelledby="barfee-title">
-                        <h2 id="barfee-title">Barfee has a question first</h2>
+                        <h2 id="barfee-title">Barfee wants you to BE SPECIFIC</h2>
                         <p class="q"></p>
                         <form id="answer-form">
                             <label class="visually-hidden" for="answer">Your answer</label>
@@ -910,9 +910,12 @@
                 if (q) perform(q);
             });
             for (const stub of document.querySelectorAll(".stub")) {
+                // Fill the question box only, so it can be edited before sending with the button or Enter
                 stub.addEventListener("click", () => {
-                    $("question").value = stub.dataset.q;
-                    perform(stub.dataset.q);
+                    const box = $("question");
+                    box.value = stub.dataset.q;
+                    box.focus();
+                    box.setSelectionRange(box.value.length, box.value.length);
                 });
             }
         </script>
