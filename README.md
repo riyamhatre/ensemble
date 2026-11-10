@@ -43,13 +43,11 @@ All of the math (averages, percent changes, comparisons with the market, medians
    gcloud config set project YOUR_PROJECT_ID
    ```
 
-4. Create a [Wikimedia Enterprise account](https://enterprise.wikimedia.com/docs/#getting-api-keys) (used for show background) and copy `.env.example` to `.env` in the project root:
+4. Create a [NYT account](https://help.nytimes.com/115010905707-Log-in-to-Your-New-York-Times-Account) (used for news articles) and copy `.env.example` to `.env` in the project root:
    ```
-   WIKIMEDIA_USERNAME=your_username
-   WIKIMEDIA_PASSWORD=your_password
-   NYT_API_KEY=your_key_here   # optional
+   NYT_API_KEY=your_key_here 
    ```
-   Without `NYT_API_KEY`, the press source reports that it isn't available. `BROADWAY_CONTACT` is only needed to rerun the ingest scripts.
+   Without `NYT_API_KEY`, the press source reports that it isn't available.
 
 5. Start the app:
    ```bash
