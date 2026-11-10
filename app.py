@@ -279,11 +279,21 @@ def get_article(title_or_url: str) -> str:
         title_or_url: The article's title or URL, e.g. 'Hamilton (musical)' or
             'https://en.wikipedia.org/wiki/Hamilton_(musical)'.
     """
-    try:
-        article = wikipedia.fetch_article(title_or_url)
-    except Exception as e:
+        # Wikipedia adds "(musical)" or "(play)" only when the bare name is taken
+    # ("Hamilton (musical)", but plain "Hadestown"), so try the other forms before giving up.
+    base = title_or_url.split("/wiki/")[-1].replace("_", " ").strip()
+    bare = base.split(" (")[0]
+    candidates = [base] + [t for t in (bare, f"{bare} (musical)", f"{bare} (play)") if t != base]
+    article, errors = None, []
+    for title in candidates:
+        try:
+            article = wikipedia.fetch_article(title)
+            break
+        except Exception as e:
+            errors.append(f"{title}: {type(e).__name__}")
+    if article is None:
         # The model cannot see an exception. Return something it can reason about.
-        return json.dumps({"error": f"Could not fetch {title_or_url}: {type(e).__name__}: {e}"})
+        return json.dumps({"error": f"No Wikipedia article found. Tried: {'; '.join(errors)}"})
     return f"# {article['title']}\n{article['description']}\nsource_url: {article['url']}\n\n{article['text']}"
 
 
