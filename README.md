@@ -2,14 +2,14 @@
 
 A deep research agent that answers questions about Broadway shows from a local database of weekly box office grosses, Tony Awards and cast recordings. Every number in a report comes from a database query, and every sentence that states a fact links to the source row it came from.
 
-## Who it's for
+## Target Users
 
-- **Theater fans** who want the numbers behind the gossip: did a show's box office really rise after its Tony win, or after a rave review?
-- **Producers and analysts** reading the market: which shows are selling below the rest of Broadway, and how a show compares with every other show playing the same weeks.
+- **Theater fans** who want the numbers behind the gossip: Did a show's box office really rise after its Tony win, or after a rave review?
+- **Producers and analysts** to read the market: which shows are selling below the rest of Broadway? How does a show compare with every other show playing the same weeks?
 
 The second point is the one a model can't do from memory. Broadway is seasonal (summers and holidays are strong, January is weak), so a show's change means little until it's compared with the market's. The agent always reports both.
 
-## How it works
+## Structure
 
 Four agents, each with its own job, plus researchers sent to one data source at a time:
 
@@ -18,16 +18,48 @@ Four agents, each with its own job, plus researchers sent to one data source at 
 3. **The Fates (researchers)**, one per task. Each copy gets the tools for one source only: `grosses`, `awards`, `music`, `cast` or `press`. They copy numbers from tool results and never compute their own.
 4. **Hamilton (writer)** sees only the question and the researchers' findings, and writes the cited report. It says plainly what the data can't answer.
 
-All arithmetic (averages, percent changes, comparisons with the market, medians across shows) happens in Python and SQL in [broadway_data.py](broadway_data.py), never in the model.
+All of the math (averages, percent changes, comparisons with the market, medians across shows) happens in Python and SQL in [broadway_data.py](broadway_data.py), never in the model.
 
-**To see the full trace, click the Backstage button** at the top of the page. It shows every agent's exact context as it works, as a timeline with one column per agent. The subagents' tool calls there carry more detail than the activity list on the main page: which tool each Fate called, with what arguments, and what came back.
+**To see the full trace, click the Backstage button** at the top right of the page. It shows every agent's exact context as it works, as a timeline with one column per agent. The subagents' tool calls there carry more detail than the activity list on the main page: which tool each agent called, with what arguments, and what came back.
 
-## Running it
+## Running Locally
 
-1. Install [uv](https://docs.astral.sh/uv/), then run `uv sync`.
-2. Copy `.env.example` to `.env`. For the app itself, only the Wikimedia login (for show background) is used. `NYT_API_KEY` is optional; without it the press source reports that it isn't available.
-3. Run `gcloud auth application-default login`. Model calls go to Gemini on Vertex AI: `gemini-3.5-flash` for Barfee, Glinda and Hamilton, and `gemini-3.5-flash-lite` for the Fates.
-4. Run `uv run app.py` and open http://localhost:8000.
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/), a free Wikimedia Enterprise account, and Google Cloud credentials for Vertex AI. An NYT API key is optional.
+
+1. Clone the repo and enter it:
+   ```bash
+   git clone https://github.com/riyamhatre/ensemble.git
+   cd ensemble
+   ```
+
+2. Set up a GCP project with billing and the Agent Platform API enabled (older docs and the endpoint itself still call it Vertex AI). Model calls go to `gemini-3.5-flash` for Barfee, Glinda and Hamilton, and `gemini-3.5-flash-lite` for the Fates.
+
+3. Authenticate with Google Cloud:
+   ```bash
+   gcloud auth application-default login
+   ```
+   The app uses your gcloud default project, so make sure it's set to the project from step 2:
+   ```bash
+   gcloud config set project YOUR_PROJECT_ID
+   ```
+
+4. Create a [Wikimedia Enterprise account](https://enterprise.wikimedia.com/docs/#getting-api-keys) (used for show background) and copy `.env.example` to `.env` in the project root:
+   ```
+   WIKIMEDIA_USERNAME=your_username
+   WIKIMEDIA_PASSWORD=your_password
+   NYT_API_KEY=your_key_here   # optional
+   ```
+   Without `NYT_API_KEY`, the press source reports that it isn't available. `BROADWAY_CONTACT` is only needed to rerun the ingest scripts.
+
+5. Start the app:
+   ```bash
+   uv run app.py
+   ```
+   Then open http://localhost:8000.
+
+Try: *"Did Hamilton's grosses rise after it won Best Musical?"*
+
+> The database ([data/broadway.db](data/broadway.db)) is committed, so the app runs without fetching any data. Grosses, awards and music answers all come from that file; only show background (Wikipedia) and press (NYT) are looked up live.
 
 Endpoints:
 
@@ -57,9 +89,9 @@ A few notes on sources:
 - **The two grosses datasets agree.** Where they overlap (2018-08 to 2020-03, 2,557 show-weeks), every gross, attendance, ticket price and performance count matches exactly.
 - **Productions are matched across sources by title and date**, because the sources share no IDs. The provisional match rules are labeled blocks in [build_db.py](build_db.py). About 94% of 1985–2021 Tony nominees link to a production in the grosses data.
 - **NYT content is never stored.** The NYT API's terms forbid keeping content longer than 24 hours, or storing it to give to others. So [nyt.py](nyt.py) looks articles up when a question needs them and keeps them only in memory, for at most 23 hours.
-- **IBDB isn't used.** Its robots.txt disallows the cast-replacement pages, and its terms page refuses automated readers. That's why there is no source of production dates, categories or cast changes beyond what's listed above.
+- **IBDB isn't used.** Its terms page refuses automated readers. That's why there is no source of production dates, categories or cast changes beyond what's listed above.
 
-### Rebuilding it from scratch
+### Rebuilding the dataset from scratch
 
 The scripts fetch politely, at most one request per second per site, through a disk cache in `data/raw/` (gitignored), so a rerun doesn't fetch anything twice.
 
@@ -72,7 +104,7 @@ uv run build_db.py             # data/csv/*.csv -> data/broadway.db, with checks
 uv run broadway_data.py        # smoke test of every query function against the database
 ```
 
-### What the data can't answer
+### What the data cannot answer
 
 The report says so when a question reaches any of these:
 - box office after 2023-03-12,
