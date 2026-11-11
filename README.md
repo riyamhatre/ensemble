@@ -84,6 +84,7 @@ Everything is in one SQLite file, [data/broadway.db](data/broadway.db), built fr
 | [MusicBrainz](https://musicbrainz.org/) web service (core data is CC0) | Broadway cast recordings and their track lists | 237 recordings for 227 productions | `recordings`, `tracks` | [ingest/musicbrainz.py](ingest/musicbrainz.py) |
 | New York Times Article Search API | Headlines, abstracts and dates of reviews and news | Looked up live, never stored | none | [nyt.py](nyt.py) |
 | Hand-curated CSV (optional) | Dated cast changes, for the star-casting question | Empty unless `data/csv/cast_changes_manual.csv` exists | `cast_changes` | [build_db.py](build_db.py) |
+| Wikipedia show articles, through the [Wikimedia Enterprise](https://enterprise.wikimedia.com/) API (needs a free account) | A show's background (its story and history) | Looked up live, never stored | none | [wikipedia.py](wikipedia.py) |
 
 The database holds 1,362 productions, 49,644 weekly gross rows, 4,028 Tony nominee rows and 5,316 tracks. Its `data_sources` table records what each source covers; the agents read it so they can say where the data ends.
 
